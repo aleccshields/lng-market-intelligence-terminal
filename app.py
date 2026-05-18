@@ -19,6 +19,8 @@ st.set_page_config(
 st.markdown("""
 <style>
     .block-container { padding-top: 1.2rem; padding-bottom: 1rem; }
+    input[type="text"] { caret-color: transparent !important; }
+    [data-baseweb="select"] input { caret-color: transparent !important; }
 
     .metric-card {
         background: #1a1a2e;
@@ -64,6 +66,7 @@ st.markdown("""
     h2 { margin-top: 0.4rem !important; margin-bottom: 0.2rem !important; }
     h3 { margin-top: 0.2rem !important; margin-bottom: 0.2rem !important; }
     .stPlotlyChart { margin-bottom: 0 !important; }
+
 </style>
 """, unsafe_allow_html=True)
 

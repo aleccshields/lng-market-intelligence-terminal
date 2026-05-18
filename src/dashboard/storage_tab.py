@@ -24,7 +24,7 @@ def render():
         "US storage from EIA Weekly Natural Gas Storage Report (weekly, Thursdays)."
     )
 
-    eu_tab, us_tab = st.tabs(["🇪🇺  European Storage", "🇺🇸  US Natural Gas Storage"])
+    eu_tab, us_tab = st.tabs(["EU", "US"])
 
     with eu_tab:
         _render_eu_section()
