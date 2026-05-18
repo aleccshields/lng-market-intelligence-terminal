@@ -1,6 +1,6 @@
 """
 src/dashboard/arbitrage_tab.py - LNG Market Intelligence Terminal
-Arbitrage Engine tab: netback calculations, route status, sensitivity table.
+Arbitrage Engine tab: netback calculations, breakeven prices, sensitivity table.
 """
 
 import streamlit as st
@@ -32,7 +32,7 @@ def render():
     st.caption(
         "Netback calculations for U.S. Gulf Coast LNG exports. "
         f"JKM values are proxy estimates {JKM_LABEL}. "
-        "Adjust cost assumptions with sliders below."
+        "Adjust cost assumptions below."
     )
 
     with st.spinner("Fetching prices..."):
@@ -95,42 +95,58 @@ def render():
     # ------------------------------------------------------------------
     st.subheader("Current Price Inputs")
     render_cards_row([
-        {"label": "Henry Hub",        "value": f"${hh:.3f}",   "sub": "USD/MMBtu"},
-        {"label": "TTF (converted)",  "value": f"${ttf:.3f}",  "sub": "USD/MMBtu"},
-        {"label": "Brent Crude",      "value": f"${brent:.2f}","sub": "USD/bbl"},
-        {"label": f"JKM {JKM_LABEL}", "value": f"${jkm:.3f}",  "sub": "USD/MMBtu · est. proxy",
+        {"label": "Henry Hub",        "value": f"${hh:.3f}",    "sub": "USD/MMBtu"},
+        {"label": "TTF (converted)",  "value": f"${ttf:.3f}",   "sub": "USD/MMBtu"},
+        {"label": "Brent Crude",      "value": f"${brent:.2f}", "sub": "USD/bbl"},
+        {"label": f"JKM {JKM_LABEL}", "value": f"${jkm:.3f}",   "sub": "USD/MMBtu · proxy",
          "color_class": "metric-warning"},
     ])
 
     st.divider()
 
     # ------------------------------------------------------------------
-    # Route result cards
+    # Route result cards — margin + breakeven side by side
     # ------------------------------------------------------------------
     st.subheader("Netback by Route")
     route_cols = st.columns(3)
     configs = [
-        ("atlantic",       "Atlantic Basin",      "U.S. Gulf → Europe"),
-        ("pacific_panama", "Pacific (Panama)",    "U.S. Gulf → Asia ~20d"),
-        ("pacific_cape",   "Pacific (Cape)",      "U.S. Gulf → Asia ~35d"),
+        ("atlantic",       "Atlantic Basin",     "U.S. Gulf → Europe"),
+        ("pacific_panama", "Pacific (Panama)",   "U.S. Gulf → Asia ~20d"),
+        ("pacific_cape",   "Pacific (Cape)",     "U.S. Gulf → Asia ~35d"),
     ]
 
     for i, (route_key, title, subtitle) in enumerate(configs):
         r   = results[route_key]
         fmt = format_result_for_display(r)
         margin_class = "metric-positive" if r.arb_open else "metric-negative"
+        be_class     = "metric-positive" if r.hh_price < r.breakeven_hh else "metric-negative"
 
         with route_cols[i]:
+            st.markdown(f"**{title}**")
+            st.caption(subtitle)
+            st.markdown(status_badge(r.arb_open), unsafe_allow_html=True)
+
+            # Margin card
             st.markdown(
                 metric_card(
-                    label=title,
+                    label="Current Margin",
                     value=fmt["margin"],
-                    sub=f"{subtitle} · {fmt['status']}",
+                    sub="vs Henry Hub",
                     color_class=margin_class,
                 ),
                 unsafe_allow_html=True,
             )
-            st.markdown(status_badge(r.arb_open), unsafe_allow_html=True)
+
+            # Breakeven HH card — the key new addition
+            st.markdown(
+                metric_card(
+                    label="Breakeven Henry Hub",
+                    value=fmt["breakeven_hh"],
+                    sub=fmt["breakeven_note"],
+                    color_class=be_class,
+                ),
+                unsafe_allow_html=True,
+            )
 
             with st.expander("Full breakdown"):
                 details = [
@@ -140,10 +156,16 @@ def render():
                     ("Regas",             fmt["regas"]),
                     ("Total cost",        fmt["total_cost"]),
                     ("Netback",           fmt["netback"]),
-                    ("Margin",            fmt["margin"]),
                 ]
                 for k, v in details:
                     st.write(f"**{k}:** {v}")
+
+    st.divider()
+
+    # ------------------------------------------------------------------
+    # Breakeven summary — single paragraph traders actually read
+    # ------------------------------------------------------------------
+    _render_breakeven_summary(results, hh)
 
     st.divider()
 
@@ -152,8 +174,7 @@ def render():
     # ------------------------------------------------------------------
     dest  = results["marginal_label"]
     best  = results["best_margin"]
-    is_open = results["marginal_dest"] != "none"
-    color = COLOR_POSITIVE if is_open else COLOR_NEGATIVE
+    color = COLOR_POSITIVE if results["marginal_dest"] != "none" else COLOR_NEGATIVE
     st.markdown(
         f"**Marginal cargo destination:** "
         f"<span style='color:{color}'>{dest}</span> "
@@ -167,7 +188,7 @@ def render():
     # Sensitivity table
     # ------------------------------------------------------------------
     st.subheader("Atlantic Arb Sensitivity")
-    st.caption("Margin ($/MMBtu) by TTF price and shipping cost scenario. Green = arb open.")
+    st.caption("Margin ($/MMBtu) by TTF price and shipping cost. Green = arb open.")
 
     sens_df = build_sensitivity_table(hh, ttf, costs)
 
@@ -193,6 +214,61 @@ def render():
     # ------------------------------------------------------------------
     st.subheader("Atlantic Margin History")
     _render_arb_history()
+
+
+def _render_breakeven_summary(results: dict, hh_price: float):
+    """
+    Render a concise breakeven summary — the key analytical output.
+
+    This is how a trader would actually read the model: not the raw
+    margin, but how far Henry Hub is from the level that closes the arb.
+    """
+    st.subheader("Breakeven Analysis")
+
+    atl = results["atlantic"]
+    pac = results["pacific_panama"]
+
+    atl_gap = atl.breakeven_hh - hh_price
+    pac_gap = pac.breakeven_hh - hh_price
+
+    lines = []
+
+    # Atlantic
+    if atl.arb_open:
+        lines.append(
+            f"**Atlantic arb is open.** Henry Hub can rise up to "
+            f"**${atl.breakeven_hh:.2f}/MMBtu** before European cargoes become "
+            f"uneconomic — **${atl_gap:.2f}/MMBtu of headroom** at current TTF."
+        )
+    else:
+        lines.append(
+            f"**Atlantic arb is closed.** Henry Hub needs to fall to "
+            f"**${atl.breakeven_hh:.2f}/MMBtu** for European cargoes to work — "
+            f"**${abs(atl_gap):.2f}/MMBtu below current levels.**"
+        )
+
+    # Pacific
+    if pac.arb_open:
+        lines.append(
+            f"**Pacific arb (Panama) is open.** Breakeven Henry Hub is "
+            f"**${pac.breakeven_hh:.2f}/MMBtu** — "
+            f"**${pac_gap:.2f}/MMBtu of headroom** at current JKM proxy."
+        )
+    else:
+        lines.append(
+            f"**Pacific arb (Panama) is closed.** Henry Hub needs to fall to "
+            f"**${pac.breakeven_hh:.2f}/MMBtu** — "
+            f"**${abs(pac_gap):.2f}/MMBtu below current levels.**"
+        )
+
+    for line in lines:
+        st.markdown(line)
+
+    st.caption(
+        "Breakeven HH = Destination Price − Liquefaction − Shipping − Regas. "
+        f"JKM is an estimated proxy {JKM_LABEL}. "
+        "All values USD/MMBtu."
+    )
 
 
 def _render_arb_history():
