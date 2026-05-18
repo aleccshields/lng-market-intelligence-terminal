@@ -2,19 +2,6 @@
 src/dashboard/storage_tab.py - LNG Market Intelligence Terminal
 
 Storage tab: EU gas storage (AGSI+) and US natural gas storage (EIA).
-
-Market context:
-    Two storage markets matter most for LNG pricing:
-
-    European storage (AGSI+):
-        Drives TTF prices and EU LNG import demand. The EU 80% mandate
-        creates a structural autumn buying season that tightens Atlantic
-        Basin balances.
-
-    US storage (EIA Weekly):
-        Drives Henry Hub prices. The storage surplus/deficit vs. the
-        5-year average is the most-watched short-term HH signal.
-        Released every Thursday at 10:30am ET.
 """
 
 import streamlit as st
@@ -25,7 +12,7 @@ from src.storage.agsi_client import (
     fetch_country_storage,
     get_storage_summary,
 )
-from src.pricing.eia_client import fetch_us_gas_storage
+from src.pricing.eia_client import fetch_us_gas_storage, US_STORAGE_REGIONS
 from src.dashboard.ui_utils import metric_card, render_cards_row
 from config import CHART_TEMPLATE, COLOR_POSITIVE, COLOR_NEGATIVE, AGSI_COUNTRY_CODES
 
@@ -33,12 +20,10 @@ from config import CHART_TEMPLATE, COLOR_POSITIVE, COLOR_NEGATIVE, AGSI_COUNTRY_
 def render():
     st.header("Gas Storage Tracker")
     st.caption(
-        "EU storage from AGSI+ (GIE). "
-        "US storage from EIA Weekly Natural Gas Storage Report. "
-        "Both updated daily."
+        "EU storage from AGSI+ (GIE, daily). "
+        "US storage from EIA Weekly Natural Gas Storage Report (weekly, Thursdays)."
     )
 
-    # Two sub-tabs
     eu_tab, us_tab = st.tabs(["🇪🇺  European Storage", "🇺🇸  US Natural Gas Storage"])
 
     with eu_tab:
@@ -46,6 +31,265 @@ def render():
 
     with us_tab:
         _render_us_section()
+
+
+# =============================================================================
+# US STORAGE — mirrors the LNG Storage Tracker logic exactly
+# =============================================================================
+
+def _render_us_section():
+    """
+    US regional natural gas storage tracker.
+
+    Replicates the logic from the standalone LNG Storage Tracker:
+        - 6 EIA regions: Lower 48, East, Midwest, South Central,
+          Mountain, Pacific
+        - 52-week history per region
+        - Latest Bcf, 52-week rolling average, surplus/deficit vs avg
+        - Line chart with rolling average reference line
+        - Week-on-week change (injection vs withdrawal)
+
+    Data: EIA Weekly Natural Gas Storage Report
+    Series: natural-gas/stor/wkly/data/ with duoarea facet
+    """
+    from config import EIA_API_KEY
+    if not EIA_API_KEY:
+        st.warning(
+            "US storage requires an EIA API key. "
+            "Register free at [eia.gov/opendata](https://www.eia.gov/opendata/) "
+            "and add `EIA_API_KEY=yourkey` to your `.env` file."
+        )
+        return
+
+    # Region selector
+    region_label = st.selectbox(
+        "Select region",
+        options=list(US_STORAGE_REGIONS.keys()),
+        index=0,
+        key="us_region_select",
+    )
+    region_code = US_STORAGE_REGIONS[region_label]
+
+    with st.spinner(f"Fetching {region_label} storage from EIA..."):
+        df = fetch_us_gas_storage(weeks=104, region_code=region_code)
+
+    if df.empty:
+        st.error(
+            f"No data returned for {region_label}. "
+            "Check EIA_API_KEY and network connection."
+        )
+        return
+
+    df = df.sort_values("date").reset_index(drop=True)
+
+    # Trim to last 52 weeks for display metrics (matches original tracker)
+    df_52 = df.tail(52).reset_index(drop=True)
+
+    latest      = df_52.iloc[-1]
+    prev_week   = df_52.iloc[-2] if len(df_52) >= 2 else None
+
+    current_bcf  = latest["storage_bcf"]
+    rolling_avg  = round(df_52["storage_bcf"].mean())
+    surplus      = round(current_bcf - rolling_avg)
+    wow_change   = round(current_bcf - prev_week["storage_bcf"]) if prev_week is not None else None
+    date_str     = latest["date"].strftime("%b %d, %Y")
+
+    injection        = wow_change is not None and wow_change > 0
+    surplus_positive = surplus >= 0
+
+    # ------------------------------------------------------------------
+    # Header cards — same three metrics as the original tracker
+    # ------------------------------------------------------------------
+    render_cards_row([
+        {
+            "label": "Latest Storage",
+            "value": f"{current_bcf:,.0f} Bcf",
+            "sub":   f"week ending {date_str}",
+        },
+        {
+            "label": "52-Wk Rolling Avg",
+            "value": f"{rolling_avg:,} Bcf",
+            "sub":   f"{region_label}",
+        },
+        {
+            "label": "vs 52-Wk Avg",
+            "value": f"{'+' if surplus_positive else ''}{surplus:,} Bcf",
+            "sub":   "SURPLUS" if surplus_positive else "DEFICIT",
+            "color_class": "metric-positive" if surplus_positive else "metric-negative",
+        },
+        {
+            "label": "Week-on-Week",
+            "value": f"{'+' if injection else ''}{wow_change:,} Bcf" if wow_change is not None else "N/A",
+            "sub":   "Injection" if injection else "Withdrawal",
+            "color_class": "metric-positive" if injection else "metric-negative",
+        },
+    ])
+
+    st.divider()
+
+    # ------------------------------------------------------------------
+    # Main chart — line chart with 52-wk average reference line
+    # ------------------------------------------------------------------
+    _render_us_storage_chart(df_52, region_label, rolling_avg)
+
+    st.divider()
+
+    # ------------------------------------------------------------------
+    # All-regions summary table
+    # ------------------------------------------------------------------
+    st.subheader("All Regions — Latest Week")
+    _render_all_regions_table()
+
+    st.divider()
+
+    # ------------------------------------------------------------------
+    # HH price signal
+    # ------------------------------------------------------------------
+    _render_us_storage_signal(current_bcf, surplus, region_label)
+
+
+def _render_us_storage_chart(df: pd.DataFrame, region_label: str, rolling_avg: float):
+    """
+    Line chart matching the original LNG Storage Tracker design:
+    storage line + 52-week average reference line.
+    """
+    st.subheader(f"{region_label} — Working Gas in Storage (Bcf)")
+
+    fig = go.Figure()
+
+    # Storage line
+    fig.add_trace(go.Scatter(
+        x=df["date"],
+        y=df["storage_bcf"],
+        name="Storage (Bcf)",
+        line=dict(color="#ff3333", width=2.5),
+        mode="lines",
+    ))
+
+    # 52-week rolling average reference line
+    fig.add_hline(
+        y=rolling_avg,
+        line_dash="dash",
+        line_color="#ffcc00",
+        line_width=2,
+        annotation_text=f"52-wk avg: {rolling_avg:,} Bcf",
+        annotation_font_color="#ffcc00",
+        annotation_position="top left",
+    )
+
+    # Shade surplus/deficit area
+    fig.add_trace(go.Scatter(
+        x=df["date"],
+        y=df["storage_bcf"],
+        fill="tonexty",
+        mode="none",
+        showlegend=False,
+        fillcolor="rgba(255,51,51,0.08)",
+    ))
+
+    fig.update_layout(
+        template=CHART_TEMPLATE,
+        height=360,
+        margin=dict(l=0, r=0, t=10, b=0),
+        yaxis=dict(title="Working Gas (Bcf)"),
+        xaxis=dict(title="Week Ending"),
+        hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02),
+    )
+
+    st.plotly_chart(fig, use_container_width=True, key=f"us_storage_{df['region'].iloc[0]}")
+    st.caption("Source: EIA Weekly Natural Gas Storage Report. Updated weekly, released Thursdays.")
+
+
+def _render_all_regions_table():
+    """
+    Fetch latest week for all 6 regions and display as a summary table.
+    Gives a quick cross-regional snapshot without separate API calls for each chart.
+    """
+    rows = []
+    for label, code in US_STORAGE_REGIONS.items():
+        df = fetch_us_gas_storage(weeks=4, region_code=code)
+        if df.empty or len(df) < 2:
+            continue
+        df = df.sort_values("date")
+        latest   = df.iloc[-1]["storage_bcf"]
+        prev     = df.iloc[-2]["storage_bcf"]
+        wow      = latest - prev
+        df_52    = fetch_us_gas_storage(weeks=52, region_code=code)
+        avg_52   = round(df_52["storage_bcf"].mean()) if not df_52.empty else None
+        surplus  = round(latest - avg_52) if avg_52 else None
+
+        rows.append({
+            "Region":        label,
+            "Storage (Bcf)": f"{latest:,.0f}",
+            "WoW Change":    f"{'+' if wow >= 0 else ''}{wow:,.0f}",
+            "vs 52-Wk Avg":  f"{'+' if surplus and surplus >= 0 else ''}{surplus:,}" if surplus else "N/A",
+            "Signal":        "Injection ↑" if wow >= 0 else "Withdrawal ↓",
+        })
+
+    if rows:
+        summary_df = pd.DataFrame(rows)
+
+        def color_wow(val):
+            if isinstance(val, str):
+                return "color: #00c896" if val.startswith("+") else "color: #ff4b4b"
+            return ""
+
+        def color_surplus(val):
+            if isinstance(val, str) and val not in ["N/A"]:
+                return "color: #00c896" if val.startswith("+") else "color: #ff4b4b"
+            return ""
+
+        st.dataframe(
+            summary_df.style
+                .map(color_wow, subset=["WoW Change"])
+                .map(color_surplus, subset=["vs 52-Wk Avg"]),
+            use_container_width=True,
+            hide_index=True,
+            key="us_regions_table",
+        )
+    else:
+        st.info("Regional summary unavailable — check EIA_API_KEY.")
+
+
+def _render_us_storage_signal(current_bcf: float, surplus: float, region: str):
+    """Henry Hub price signal interpretation from storage position."""
+    st.subheader("Henry Hub Storage Signal")
+
+    if surplus > 200:
+        signal, css = "BEARISH HH", "metric-negative"
+        note = (
+            f"{region} storage is {surplus:,} Bcf above its 52-week average. "
+            "A significant surplus suggests ample supply, weighing on Henry Hub prices."
+        )
+    elif surplus > 0:
+        signal, css = "MILDLY BEARISH", "metric-warning"
+        note = (
+            f"{region} storage is {surplus:,} Bcf above its 52-week average. "
+            "A modest surplus provides a soft ceiling on Henry Hub prices."
+        )
+    elif surplus > -200:
+        signal, css = "MILDLY BULLISH", "metric-warning"
+        note = (
+            f"{region} storage is {abs(surplus):,} Bcf below its 52-week average. "
+            "A modest deficit provides support for Henry Hub prices."
+        )
+    else:
+        signal, css = "BULLISH HH", "metric-positive"
+        note = (
+            f"{region} storage is {abs(surplus):,} Bcf below its 52-week average. "
+            "A significant deficit is supportive of higher Henry Hub prices "
+            "and tighter LNG export economics."
+        )
+
+    st.markdown(
+        metric_card(label="HH Signal", value=signal, sub=note, color_class=css),
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        "Signal based on surplus/deficit vs 52-week rolling average. "
+        "Professional analysis uses EIA 5-year average published in the weekly storage report."
+    )
 
 
 # =============================================================================
@@ -61,25 +305,25 @@ def _render_eu_section():
         return
 
     summary = get_storage_summary(eu_df)
-
-    # Header cards
-    trend_val   = summary.get("trend_7d")
-    yoy_val     = summary.get("yoy_change")
-    latest_date = summary["latest_date"].strftime("%b %d, %Y") if summary.get("latest_date") else "N/A"
-
-    trend_class = ("metric-positive" if trend_val and trend_val >= 0 else "metric-negative") if trend_val is not None else ""
-    yoy_class   = ("metric-positive" if yoy_val and yoy_val >= 0 else "metric-negative") if yoy_val is not None else ""
+    trend   = summary.get("trend_7d")
+    yoy     = summary.get("yoy_change")
+    date_str = summary["latest_date"].strftime("%b %d, %Y") if summary.get("latest_date") else "N/A"
 
     render_cards_row([
-        {"label": "EU Storage Fill",  "value": f"{summary['latest_pct']:.1f}%",
+        {"label": "EU Storage Fill",
+         "value": f"{summary['latest_pct']:.1f}%",
          "sub": "of working capacity"},
-        {"label": "As of",            "value": latest_date,         "sub": "AGSI+ report date"},
+        {"label": "As of",
+         "value": date_str,
+         "sub": "AGSI+ report date"},
         {"label": "7-Day Change",
-         "value": f"{trend_val:+.2f} pp" if trend_val is not None else "N/A",
-         "sub": "percentage points", "color_class": trend_class},
+         "value": f"{trend:+.2f} pp" if trend is not None else "N/A",
+         "sub": "percentage points",
+         "color_class": "metric-positive" if trend and trend >= 0 else "metric-negative"},
         {"label": "Year-on-Year",
-         "value": f"{yoy_val:+.2f} pp" if yoy_val is not None else "N/A",
-         "sub": "vs same date last year", "color_class": yoy_class},
+         "value": f"{yoy:+.2f} pp" if yoy is not None else "N/A",
+         "sub": "vs same date last year",
+         "color_class": "metric-positive" if yoy and yoy >= 0 else "metric-negative"},
     ])
 
     st.divider()
@@ -93,7 +337,7 @@ def _render_eu_section():
     st.divider()
 
     st.subheader("Country Storage")
-    country_names = [k for k in AGSI_COUNTRY_CODES if AGSI_COUNTRY_CODES[k] != "eu"]
+    country_names  = [k for k in AGSI_COUNTRY_CODES if AGSI_COUNTRY_CODES[k] != "eu"]
     country_option = st.selectbox("Select country", country_names, index=0, key="eu_country_select")
     country_code   = AGSI_COUNTRY_CODES[country_option]
 
@@ -106,7 +350,8 @@ def _render_eu_section():
         t  = cs.get("trend_7d")
         y  = cs.get("yoy_change")
         render_cards_row([
-            {"label": f"{country_option} Fill", "value": f"{cs.get('latest_pct',0):.1f}%",
+            {"label": f"{country_option} Fill",
+             "value": f"{cs.get('latest_pct', 0):.1f}%",
              "sub": "of working capacity"},
             {"label": "7-Day Trend",
              "value": f"{t:+.2f} pp" if t is not None else "N/A",
@@ -122,199 +367,13 @@ def _render_eu_section():
     _render_eu_storage_signal(summary.get("latest_pct", 0), summary.get("yoy_change"))
 
 
-# =============================================================================
-# US STORAGE
-# =============================================================================
-
-def _render_us_section():
-    """
-    US natural gas storage tracker using EIA weekly data.
-
-    The EIA Weekly Natural Gas Storage Report (released every Thursday)
-    shows working gas in underground storage for the Lower 48 states.
-    The surplus/deficit vs. the 5-year average is the most-watched
-    short-term Henry Hub price signal.
-
-    High storage (surplus) = bearish HH, reduces need for imports
-    Low storage (deficit)  = bullish HH, tightens supply balance
-    """
-    if not _check_eia_key():
-        return
-
-    with st.spinner("Fetching US storage from EIA..."):
-        df = fetch_us_gas_storage(weeks=104)   # 2 years
-
-    if df.empty:
-        st.error("Unable to fetch US storage data. Check EIA_API_KEY in .env")
-        return
-
-    # Sort ascending
-    df = df.sort_values("date").reset_index(drop=True)
-
-    latest      = df.iloc[-1]
-    prev_week   = df.iloc[-2] if len(df) >= 2 else None
-    yoy_row     = _get_yoy_row(df)
-
-    current_bcf = latest["storage_bcf"]
-    wow_change  = (current_bcf - prev_week["storage_bcf"]) if prev_week is not None else None
-    yoy_change  = (current_bcf - yoy_row["storage_bcf"]) if yoy_row is not None else None
-    date_str    = latest["date"].strftime("%b %d, %Y")
-
-    # Injection/withdrawal flag
-    injection = wow_change is not None and wow_change > 0
-    inj_label = f"{'Injection' if injection else 'Withdrawal'} week"
-    inj_class = "metric-positive" if injection else "metric-negative"
-
-    render_cards_row([
-        {"label": "US Working Gas",
-         "value": f"{current_bcf:,.0f} Bcf",
-         "sub": f"as of {date_str}"},
-        {"label": "Week-on-Week",
-         "value": f"{wow_change:+,.0f} Bcf" if wow_change is not None else "N/A",
-         "sub": inj_label,
-         "color_class": inj_class},
-        {"label": "Year-on-Year",
-         "value": f"{yoy_change:+,.0f} Bcf" if yoy_change is not None else "N/A",
-         "sub": "vs same week last year",
-         "color_class": "metric-positive" if yoy_change and yoy_change >= 0 else "metric-negative"},
-        {"label": "5-Year Avg Range",
-         "value": "2,800–3,800",
-         "sub": "Bcf typical end-Oct range"},
-    ])
-
-    st.divider()
-
-    col1, col2 = st.columns([3, 1])
-    with col1:
-        _render_us_storage_chart(df)
-    with col2:
-        _render_us_storage_signal(current_bcf, yoy_change)
-
-
-def _check_eia_key() -> bool:
-    """Show a friendly message if EIA key is not configured."""
-    from config import EIA_API_KEY
-    if not EIA_API_KEY:
-        st.warning(
-            "US storage requires an EIA API key. "
-            "Register free at [eia.gov/opendata](https://www.eia.gov/opendata/) "
-            "and add `EIA_API_KEY=yourkey` to your `.env` file."
-        )
-        return False
-    return True
-
-
-def _get_yoy_row(df: pd.DataFrame):
-    """Find the row closest to 52 weeks ago."""
-    if df.empty or len(df) < 10:
-        return None
-    latest      = df.iloc[-1]["date"]
-    target      = latest - pd.Timedelta(weeks=52)
-    df_copy     = df.copy()
-    df_copy["diff"] = (df_copy["date"] - target).abs()
-    return df_copy.loc[df_copy["diff"].idxmin()]
-
-
-def _render_us_storage_chart(df: pd.DataFrame):
-    """US storage level over time with YoY comparison."""
-    st.subheader("US Working Gas in Storage (Lower 48, Bcf)")
-
-    # Split into current year and prior year for overlay
-    if df.empty:
-        return
-
-    latest_year = df["date"].dt.year.max()
-    curr = df[df["date"].dt.year == latest_year].copy()
-    prev = df[df["date"].dt.year == latest_year - 1].copy()
-
-    fig = go.Figure()
-
-    if not prev.empty:
-        fig.add_trace(go.Scatter(
-            x=prev["date"], y=prev["storage_bcf"],
-            name=f"{latest_year - 1}",
-            line=dict(color="#555577", width=1.5, dash="dot"),
-            opacity=0.7,
-        ))
-
-    if not curr.empty:
-        fig.add_trace(go.Scatter(
-            x=curr["date"], y=curr["storage_bcf"],
-            name=str(latest_year),
-            line=dict(color=COLOR_POSITIVE, width=2.5),
-            fill="tozeroy",
-            fillcolor="rgba(0,200,150,0.08)",
-        ))
-
-    # Reference bands for seasonal context
-    fig.add_hrect(y0=3500, y1=4000, fillcolor="rgba(0,200,150,0.05)",
-                  line_width=0, annotation_text="High storage band")
-    fig.add_hrect(y0=1500, y1=2000, fillcolor="rgba(255,75,75,0.05)",
-                  line_width=0, annotation_text="Low storage band")
-
-    fig.update_layout(
-        template=CHART_TEMPLATE, height=340,
-        margin=dict(l=0, r=0, t=10, b=0),
-        yaxis=dict(title="Bcf"),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02),
-        hovermode="x unified",
-    )
-    st.plotly_chart(fig, use_container_width=True, key="us_storage_chart")
-
-
-def _render_us_storage_signal(current_bcf: float, yoy_change: float = None):
-    """Henry Hub price signal from US storage levels."""
-    st.subheader("HH Signal")
-
-    # Rough seasonal context: use absolute level as signal
-    if current_bcf >= 3500:
-        signal, color = "BEARISH HH", "#ff4b4b"
-        note = "Storage is elevated. Bearish for Henry Hub prices near term."
-    elif current_bcf >= 2500:
-        signal, color = "NEUTRAL", "orange"
-        note = "Storage within normal range. HH direction driven by weather and demand."
-    else:
-        signal, color = "BULLISH HH", "#00c896"
-        note = "Storage is below seasonal norms. Supportive of higher Henry Hub prices."
-
-    st.markdown(
-        metric_card(
-            label="Storage Signal",
-            value=signal,
-            sub=note,
-            color_class="metric-positive" if "BULL" in signal else (
-                "metric-negative" if "BEAR" in signal else "metric-warning"
-            ),
-        ),
-        unsafe_allow_html=True,
-    )
-
-    if yoy_change is not None:
-        direction = "above" if yoy_change >= 0 else "below"
-        st.caption(
-            f"Storage is {abs(yoy_change):,.0f} Bcf {direction} "
-            f"the same week last year."
-        )
-
-    st.caption(
-        "Signal uses absolute storage level as a heuristic. "
-        "Professional analysis uses the 5-year average comparison "
-        "published in the EIA Weekly Natural Gas Storage Report."
-    )
-
-
-# =============================================================================
-# EU CHART HELPERS
-# =============================================================================
-
-def _render_eu_fill_chart(eu_df: pd.DataFrame, key: str = "eu_fill"):
+def _render_eu_fill_chart(eu_df, key="eu_fill"):
     st.subheader("EU Aggregate Fill (%)")
     fig = go.Figure()
     fig.add_trace(go.Scatter(
         x=eu_df["date"], y=eu_df["full_pct"],
-        name="EU Fill (%)",
         line=dict(color=COLOR_POSITIVE, width=2),
-        fill="tozeroy", fillcolor="rgba(0,200,150,0.1)",
+        fill="tozeroy", fillcolor="rgba(0,200,150,0.1)", name="EU Fill (%)",
     ))
     fig.add_hline(y=80, line_dash="dash", line_color="yellow",
                   opacity=0.7, annotation_text="EU Mandate (80%)")
@@ -329,7 +388,7 @@ def _render_eu_fill_chart(eu_df: pd.DataFrame, key: str = "eu_fill"):
     st.plotly_chart(fig, use_container_width=True, key=key)
 
 
-def _render_storage_gauge(fill_pct: float, key: str = "eu_gauge"):
+def _render_storage_gauge(fill_pct, key="eu_gauge"):
     st.subheader("Current Level")
     bar_color = COLOR_POSITIVE if fill_pct > 80 else ("orange" if fill_pct > 50 else COLOR_NEGATIVE)
     fig = go.Figure(go.Indicator(
@@ -350,19 +409,17 @@ def _render_storage_gauge(fill_pct: float, key: str = "eu_gauge"):
         },
         number={"suffix": "%"},
     ))
-    fig.update_layout(
-        template=CHART_TEMPLATE, height=320,
-        margin=dict(l=20, r=20, t=40, b=20),
-    )
+    fig.update_layout(template=CHART_TEMPLATE, height=320,
+                      margin=dict(l=20, r=20, t=40, b=20))
     st.plotly_chart(fig, use_container_width=True, key=key)
 
 
-def _render_country_chart(df: pd.DataFrame, country_name: str, key: str = "country_chart"):
+def _render_country_chart(df, country_name, key="country_chart"):
     fig = go.Figure()
     fig.add_trace(go.Scatter(
         x=df["date"], y=df["full_pct"],
-        name=f"{country_name} Fill (%)",
         line=dict(color=COLOR_POSITIVE, width=2),
+        name=f"{country_name} Fill (%)",
     ))
     fig.add_hline(y=80, line_dash="dash", line_color="yellow",
                   opacity=0.6, annotation_text="80% mandate")
@@ -375,25 +432,25 @@ def _render_country_chart(df: pd.DataFrame, country_name: str, key: str = "count
     st.plotly_chart(fig, use_container_width=True, key=key)
 
 
-def _render_eu_storage_signal(fill_pct: float, yoy_change: float = None):
+def _render_eu_storage_signal(fill_pct, yoy_change=None):
     if fill_pct >= 80:
-        signal, color = "BEARISH FOR TTF", "#ff4b4b"
-        explanation = (
+        signal, css = "BEARISH FOR TTF", "metric-negative"
+        note = (
             f"At {fill_pct:.1f}%, storage is at or above the EU mandate. "
             "Europe has limited near-term need for spot LNG. "
             "Bearish for TTF; may redirect U.S. cargoes toward Asia."
         )
     elif fill_pct >= 60:
-        signal, color = "NEUTRAL", "orange"
-        explanation = (
-            f"At {fill_pct:.1f}%,  seasonal injection is underway. "
+        signal, css = "NEUTRAL", "metric-warning"
+        note = (
+            f"At {fill_pct:.1f}%, seasonal injection is underway. "
             "Europe needs continued purchases to reach the 80% winter target."
         )
     else:
-        signal, color = "BULLISH FOR TTF", "#00c896"
-        explanation = (
+        signal, css = "BULLISH FOR TTF", "metric-positive"
+        note = (
             f"At {fill_pct:.1f}%, storage is below comfortable levels. "
-            "Aggressive injection buying is needed, supporting TTF and "
+            "Aggressive injection buying needed, supporting TTF and "
             "Atlantic Basin LNG import demand."
         )
 
@@ -402,19 +459,13 @@ def _render_eu_storage_signal(fill_pct: float, yoy_change: float = None):
         direction = "above" if yoy_change >= 0 else "below"
         yoy_note = f" Storage is {abs(yoy_change):.1f} pp {direction} last year."
 
-    st.subheader("Storage Signal")
+    st.subheader("EU Storage Signal")
     st.markdown(
-        metric_card(
-            label="EU Signal",
-            value=signal,
-            sub=explanation + yoy_note,
-            color_class="metric-positive" if "BULL" in signal else (
-                "metric-negative" if "BEAR" in signal else "metric-warning"
-            ),
-        ),
+        metric_card(label="EU Signal", value=signal,
+                    sub=note + yoy_note, color_class=css),
         unsafe_allow_html=True,
     )
     st.caption(
         "Simplified heuristic. Professional analysis incorporates "
-        "5-year averages, injection rate trends, and demand forecasts."
+        "5-year averages, injection rates, and demand forecasts."
     )

@@ -4,26 +4,19 @@ src/pricing/eia_client.py - LNG Market Intelligence Terminal
 Fetches U.S. natural gas data from the EIA Open Data API v2.
 
 Market context:
-    The EIA (U.S. Energy Information Administration) publishes free,
-    high-quality natural gas data including:
-        - Henry Hub spot prices (daily)
-        - U.S. natural gas storage (weekly, every Thursday)
-        - LNG export volumes by terminal (monthly)
-
     Henry Hub is the primary U.S. natural gas pricing hub and the
-    reference point for most U.S. LNG export contracts. Sabine Pass,
-    Corpus Christi, and other Gulf Coast terminals sell LNG at contracts
-    typically priced as 115% x Henry Hub + a fixed liquefaction fee.
+    reference point for most U.S. LNG export contracts.
 
-    Storage data matters because U.S. gas storage vs. the 5-year average
-    is a key short-term price signal — low storage = bullish Henry Hub.
+    Storage data matters because the surplus/deficit vs. the 52-week
+    rolling average is the most-watched short-term HH price signal.
+    Released every Thursday at 10:30am ET.
 
-    In production, traders use Platts or Bloomberg for real-time HH
-    pricing, but EIA spot data (1-day lag) is the gold standard for
-    historical analysis and is the source most academic work cites.
+    Regional storage matters for basis differentials — the South Central
+    region (salt and nonsalt caverns) is the most flexible and fills/draws
+    fastest, making it the most market-moving regional reporter.
 
 Requires:
-    EIA_API_KEY set in .env file.
+    EIA_API_KEY set in .env or Streamlit secrets.
     Register free at: https://www.eia.gov/opendata/
 """
 
@@ -33,19 +26,21 @@ from datetime import datetime, timedelta
 from config import EIA_API_KEY, EIA_BASE_URL
 
 
+# EIA region codes matching the original storage tracker
+US_STORAGE_REGIONS = {
+    "Lower 48 States":    "R48",
+    "East Region":        "R31",
+    "Midwest Region":     "R32",
+    "South Central":      "R33",
+    "Mountain Region":    "R34",
+    "Pacific Region":     "R35",
+}
+
+
 def _get(endpoint: str, params: dict) -> dict | None:
-    """
-    Internal helper — makes a GET request to the EIA API v2.
-
-    Args:
-        endpoint : API path after base URL (e.g. 'natural-gas/pri/sum/data/')
-        params   : Query parameters dict
-
-    Returns:
-        Parsed JSON response dict, or None on failure.
-    """
+    """Internal GET helper for EIA API v2."""
     if not EIA_API_KEY:
-        print("Warning: EIA_API_KEY not set. Skipping EIA fetch.")
+        print("Warning: EIA_API_KEY not set.")
         return None
 
     params["api_key"] = EIA_API_KEY
@@ -66,12 +61,8 @@ def fetch_henry_hub_spot(days: int = 90) -> pd.DataFrame:
 
     Series: NG.RNGWHHD.D (Henry Hub Natural Gas Spot Price, Dollars per MMBtu)
 
-    Args:
-        days : Number of days of history to fetch
-
     Returns:
         DataFrame with columns [date, price_usd_mmbtu], sorted ascending.
-        Returns empty DataFrame if API key missing or request fails.
     """
     start_date = (datetime.today() - timedelta(days=days)).strftime("%Y-%m-%d")
 
@@ -90,42 +81,46 @@ def fetch_henry_hub_spot(days: int = 90) -> pd.DataFrame:
 
     try:
         rows = data["response"]["data"]
-        df = pd.DataFrame(rows)
-        df = df[["period", "value"]].copy()
+        df = pd.DataFrame(rows)[["period", "value"]].copy()
         df.columns = ["date", "price_usd_mmbtu"]
         df["date"] = pd.to_datetime(df["date"])
         df["price_usd_mmbtu"] = pd.to_numeric(df["price_usd_mmbtu"], errors="coerce")
-        df = df.dropna().sort_values("date").reset_index(drop=True)
-        return df
+        return df.dropna().sort_values("date").reset_index(drop=True)
     except (KeyError, TypeError) as e:
         print(f"EIA Henry Hub parse error: {e}")
         return pd.DataFrame()
 
 
-def fetch_us_gas_storage(weeks: int = 52) -> pd.DataFrame:
+def fetch_us_gas_storage(weeks: int = 52, region_code: str = "R48") -> pd.DataFrame:
     """
-    Fetch U.S. weekly natural gas storage from EIA.
+    Fetch U.S. weekly natural gas storage for a specific region.
 
-    Series: NG.NW2_EPG0_SWO_R48_BCF.W
-    (Working Gas in Underground Storage, Lower 48 States, BCF)
+    Uses the duoarea facet to filter by region, matching the original
+    LNG Storage Tracker exactly.
 
-    Published every Thursday covering the week ending the prior Friday.
-    The storage surplus/deficit vs. the 5-year average is a key
-    short-term price driver — traders watch this number closely.
+    Region codes:
+        R48 = Lower 48 States (national aggregate)
+        R31 = East Region
+        R32 = Midwest Region
+        R33 = South Central Region
+        R34 = Mountain Region
+        R35 = Pacific Region
 
     Args:
-        weeks : Number of weeks of history to fetch
+        weeks       : Number of weeks of history to fetch (default 52)
+        region_code : EIA duoarea code (default 'R48' = national)
 
     Returns:
-        DataFrame with columns [date, storage_bcf], sorted ascending.
-        Returns empty DataFrame on failure.
+        DataFrame with columns [date, storage_bcf, region],
+        sorted ascending. Returns empty DataFrame on failure.
     """
     start_date = (datetime.today() - timedelta(weeks=weeks)).strftime("%Y-%m-%d")
 
     data = _get("natural-gas/stor/wkly/data/", {
         "frequency": "weekly",
         "data[0]": "value",
-        "facets[series][]": "NW2_EPG0_SWO_R48_BCF",
+        "facets[duoarea][]": region_code,
+        "facets[process][]": "SWO",
         "start": start_date,
         "sort[0][column]": "period",
         "sort[0][direction]": "asc",
@@ -137,16 +132,40 @@ def fetch_us_gas_storage(weeks: int = 52) -> pd.DataFrame:
 
     try:
         rows = data["response"]["data"]
+        if not rows:
+            return pd.DataFrame()
+
         df = pd.DataFrame(rows)
         df = df[["period", "value"]].copy()
         df.columns = ["date", "storage_bcf"]
         df["date"] = pd.to_datetime(df["date"])
         df["storage_bcf"] = pd.to_numeric(df["storage_bcf"], errors="coerce")
-        df = df.dropna().sort_values("date").reset_index(drop=True)
-        return df
+        df["region"] = region_code
+        return df.dropna().sort_values("date").reset_index(drop=True)
     except (KeyError, TypeError) as e:
-        print(f"EIA storage parse error: {e}")
+        print(f"EIA storage parse error for {region_code}: {e}")
         return pd.DataFrame()
+
+
+def fetch_all_regions(weeks: int = 52) -> dict:
+    """
+    Fetch storage data for all six EIA regions.
+
+    Args:
+        weeks : Number of weeks of history per region
+
+    Returns:
+        Dict mapping region label -> DataFrame.
+        Regions that fail to fetch are excluded with a warning.
+    """
+    results = {}
+    for label, code in US_STORAGE_REGIONS.items():
+        df = fetch_us_gas_storage(weeks=weeks, region_code=code)
+        if not df.empty:
+            results[label] = df
+        else:
+            print(f"  Warning: no data for {label} ({code})")
+    return results
 
 
 if __name__ == "__main__":
@@ -154,14 +173,13 @@ if __name__ == "__main__":
 
     hh = fetch_henry_hub_spot(days=30)
     if not hh.empty:
-        print(f"  Henry Hub spot: {len(hh)} rows fetched")
-        print(f"  Latest: ${hh['price_usd_mmbtu'].iloc[-1]:.3f}/MMBtu on {hh['date'].iloc[-1].date()}")
+        print(f"  Henry Hub: ${hh['price_usd_mmbtu'].iloc[-1]:.3f}/MMBtu on {hh['date'].iloc[-1].date()}")
     else:
         print("  Henry Hub: no data (check EIA_API_KEY in .env)")
 
-    storage = fetch_us_gas_storage(weeks=8)
-    if not storage.empty:
-        print(f"  US Storage: {len(storage)} weeks fetched")
-        print(f"  Latest: {storage['storage_bcf'].iloc[-1]:,.0f} BCF on {storage['date'].iloc[-1].date()}")
-    else:
-        print("  Storage: no data (check EIA_API_KEY in .env)")
+    for label, code in US_STORAGE_REGIONS.items():
+        df = fetch_us_gas_storage(weeks=4, region_code=code)
+        if not df.empty:
+            print(f"  {label}: {df['storage_bcf'].iloc[-1]:,.0f} Bcf on {df['date'].iloc[-1].date()}")
+        else:
+            print(f"  {label}: no data")
