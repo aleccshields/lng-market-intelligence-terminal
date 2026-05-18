@@ -6,10 +6,12 @@ Market Dashboard tab: live prices, spreads, rolling metrics, volatility.
 import streamlit as st
 import plotly.graph_objects as go
 import pandas as pd
+from datetime import datetime, timezone
 from src.pricing.yfinance_client import fetch_all_prices, fetch_all_histories
 from src.pricing.price_utils import (
     build_price_summary,
     estimate_jkm_series,
+    estimate_jkm,
     compute_spread,
     compute_rolling_average,
     compute_realized_volatility,
@@ -26,18 +28,33 @@ from config import (
 
 def render(lookback_days: int = LOOKBACK_DEFAULT):
     st.header("Market Dashboard")
-    st.caption(
-        "Front-month futures via yfinance (~15 min delay). "
-        "JKM is a proxy estimate (Brent × 0.172 + premium). Not for trading."
-    )
 
     with st.spinner("Fetching prices..."):
-        prices = fetch_all_prices()
+        prices   = fetch_all_prices()
         histories = fetch_all_histories(days=lookback_days)
 
     if not any(v for k, v in prices.items() if k.endswith("price")):
         st.error("Unable to fetch price data. Check network connection.")
         return
+
+    # ------------------------------------------------------------------
+    # Timestamp — shown immediately below the header
+    # ------------------------------------------------------------------
+    fetched_at = prices.get("fetched_at", "")
+    if fetched_at:
+        try:
+            dt = datetime.fromisoformat(fetched_at)
+            ts = dt.strftime("%H:%M:%S UTC, %b %d %Y")
+        except ValueError:
+            ts = fetched_at
+    else:
+        ts = datetime.now(timezone.utc).strftime("%H:%M:%S UTC, %b %d %Y")
+
+    st.caption(
+        f"Last fetched: **{ts}** · yfinance front-month futures (~15 min delay) · "
+        f"Brent: EIA spot · JKM: proxy estimate (Brent × 0.172 + premium) · "
+        "Not for trading."
+    )
 
     _render_metric_cards(prices)
 
@@ -57,17 +74,10 @@ def render(lookback_days: int = LOOKBACK_DEFAULT):
 
 
 def _render_metric_cards(prices: dict):
-    """
-    Render the top-row price cards.
-    Values are always plain numbers — units go in the sub field only.
-    """
     hh    = prices.get("hh_price")
     ttf   = prices.get("ttf_usd_mmbtu")
     brent = prices.get("brent_price")
-    eur   = prices.get("eur_usd", 1.08)
-
-    from src.pricing.price_utils import estimate_jkm
-    jkm = estimate_jkm(brent) if brent else None
+    jkm   = estimate_jkm(brent) if brent else None
 
     ttf_hh_spread = (ttf - hh) if (ttf and hh) else None
     jkm_hh_spread = (jkm - hh) if (jkm and hh) else None
@@ -78,39 +88,27 @@ def _render_metric_cards(prices: dict):
         return "metric-positive" if v >= 0 else "metric-negative"
 
     render_cards_row([
-        {
-            "label": "Henry Hub",
-            "value": f"${hh:.3f}" if hh else "N/A",
-            "sub": "USD/MMBtu",
-        },
-        {
-            "label": "TTF (converted)",
-            "value": f"${ttf:.3f}" if ttf else "N/A",
-            "sub": "USD/MMBtu",
-        },
-        {
-            "label": "Brent Crude",
-            "value": f"${brent:.2f}" if brent else "N/A",
-            "sub": "USD/bbl",
-        },
-        {
-            "label": f"JKM {JKM_LABEL}",
-            "value": f"${jkm:.3f}" if jkm else "N/A",
-            "sub": "USD/MMBtu · proxy",
-            "color_class": "metric-warning",
-        },
-        {
-            "label": "TTF−HH Spread",
-            "value": f"${ttf_hh_spread:+.3f}" if ttf_hh_spread is not None else "N/A",
-            "sub": "USD/MMBtu",
-            "color_class": spread_class(ttf_hh_spread),
-        },
-        {
-            "label": f"JKM−HH {JKM_LABEL}",
-            "value": f"${jkm_hh_spread:+.3f}" if jkm_hh_spread is not None else "N/A",
-            "sub": "USD/MMBtu · proxy",
-            "color_class": spread_class(jkm_hh_spread),
-        },
+        {"label": "Henry Hub",
+         "value": f"${hh:.3f}" if hh else "N/A",
+         "sub": "USD/MMBtu"},
+        {"label": "TTF (converted)",
+         "value": f"${ttf:.3f}" if ttf else "N/A",
+         "sub": "USD/MMBtu"},
+        {"label": "Brent Crude",
+         "value": f"${brent:.2f}" if brent else "N/A",
+         "sub": "USD/bbl"},
+        {"label": f"JKM {JKM_LABEL}",
+         "value": f"${jkm:.3f}" if jkm else "N/A",
+         "sub": "USD/MMBtu · proxy",
+         "color_class": "metric-warning"},
+        {"label": "TTF−HH Spread",
+         "value": f"${ttf_hh_spread:+.3f}" if ttf_hh_spread is not None else "N/A",
+         "sub": "USD/MMBtu",
+         "color_class": spread_class(ttf_hh_spread)},
+        {"label": f"JKM−HH {JKM_LABEL}",
+         "value": f"${jkm_hh_spread:+.3f}" if jkm_hh_spread is not None else "N/A",
+         "sub": "USD/MMBtu · proxy",
+         "color_class": spread_class(jkm_hh_spread)},
     ])
 
 
